@@ -121,6 +121,7 @@ typedef struct OutputStream {
     const char *single_file_name;  /* file names selected for this particular stream */
     const char *init_seg_name;
     const char *media_seg_name;
+    uint8_t *temp_buffer;
 
     char codec_str[100];
     int written_len;
@@ -239,12 +240,13 @@ static int dashenc_io_open(AVFormatContext *s, AVIOContext **pb, char *filename,
     return err;
 }
 
-static void dashenc_io_close(AVFormatContext *s, AVIOContext **pb, char *filename) {
+static int dashenc_io_close(AVFormatContext *s, AVIOContext **pb, char *filename) {
     DASHContext *c = s->priv_data;
     int http_base_proto = filename ? ff_is_http_proto(filename) : 0;
 
+    int ret = 0;
     if (!*pb)
-        return;
+        return ret;
 
     if (!http_base_proto || !c->http_persistent) {
         ff_format_io_close(s, pb);
@@ -254,8 +256,10 @@ static void dashenc_io_close(AVFormatContext *s, AVIOContext **pb, char *filenam
         av_assert0(http_url_context);
         avio_flush(*pb);
         ffurl_shutdown(http_url_context, AVIO_FLAG_WRITE);
+        ret = ff_http_get_shutdown_status(http_url_context);
 #endif
     }
+    return ret;
 }
 
 static const char *get_format_str(SegmentType segment_type) {
@@ -453,31 +457,36 @@ static void set_codec_str(AVFormatContext *s, AVCodecParameters *par,
 
 static int flush_dynbuf(DASHContext *c, OutputStream *os, int *range_length)
 {
-    uint8_t *buffer;
+    AVFormatContext *ctx = os->ctx;
 
-    if (!os->ctx->pb) {
+    if (!ctx->pb) {
         return AVERROR(EINVAL);
     }
 
     // flush
-    av_write_frame(os->ctx, NULL);
-    avio_flush(os->ctx->pb);
+    av_write_frame(ctx, NULL);
+    avio_flush(ctx->pb);
 
     if (!c->single_file) {
         // write out to file
-        *range_length = avio_close_dyn_buf(os->ctx->pb, &buffer);
-        os->ctx->pb = NULL;
+        *range_length = avio_close_dyn_buf(ctx->pb, &os->temp_buffer);
+        ctx->pb = NULL;
         if (os->out)
-            avio_write(os->out, buffer + os->written_len, *range_length - os->written_len);
+            avio_write(os->out, os->temp_buffer + os->written_len, *range_length - os->written_len);
         os->written_len = 0;
-        av_free(buffer);
 
         // re-open buffer
-        return avio_open_dyn_buf(&os->ctx->pb);
+        return avio_open_dyn_buf(&ctx->pb);
     } else {
-        *range_length = avio_tell(os->ctx->pb) - os->pos;
+        *range_length = avio_tell(ctx->pb) - os->pos;
         return 0;
     }
+}
+
+static void reflush_dynbuf(OutputStream *os, int *range_length)
+{
+    // re-open buffer
+    avio_write(os->out, os->temp_buffer, *range_length);;
 }
 
 static void set_http_options(AVDictionary **options, DASHContext *c)
@@ -596,6 +605,7 @@ static int flush_init_segment(AVFormatContext *s, OutputStream *os)
     int ret, range_length;
 
     ret = flush_dynbuf(c, os, &range_length);
+    av_freep(&os->temp_buffer);
     if (ret < 0)
         return ret;
 
@@ -642,6 +652,7 @@ static void dash_free(AVFormatContext *s)
         av_freep(&os->single_file_name);
         av_freep(&os->init_seg_name);
         av_freep(&os->media_seg_name);
+        av_freep(&os->temp_buffer);
     }
     av_freep(&c->streams);
 
@@ -1241,7 +1252,18 @@ static int write_manifest(AVFormatContext *s, int final)
 
     avio_printf(out, "</MPD>\n");
     avio_flush(out);
-    dashenc_io_close(s, &c->mpd_out, temp_filename);
+    ret = dashenc_io_close(s, &c->mpd_out, temp_filename);
+    if (ret < 0) {
+        av_log(s, AV_LOG_WARNING, "upload manifest failed, will retry with a new http session.\n");
+        ff_format_io_close(s, &c->mpd_out);
+
+        set_http_options(&opts, c);
+        dashenc_io_open(s, &c->mpd_out, temp_filename, &opts);
+        av_dict_free(&opts);
+
+        dashenc_io_close(s, &c->mpd_out, temp_filename);
+        return ret;
+    }
 
     if (use_rename) {
         if ((ret = ff_rename(temp_filename, s->url, s)) < 0)
@@ -1939,7 +1961,21 @@ static int dash_flush(AVFormatContext *s, int final, int stream)
         if (c->single_file) {
             find_index_range(s, os->full_path, os->pos, &index_length);
         } else {
-            dashenc_io_close(s, &os->out, os->temp_path);
+            ret = dashenc_io_close(s, &os->out, os->temp_path);
+            if (ret < 0) {
+                AVDictionary *http_opts = NULL;
+
+                av_log(s, AV_LOG_WARNING, "upload segment failed, will retry with a new http session.\n");
+                ff_format_io_close(s, &os->out);
+
+                set_http_options(&http_opts, c);
+                ret = dashenc_io_open(s, &os->out, os->temp_path, &http_opts);
+                av_dict_free(&http_opts);
+
+                reflush_dynbuf(os, &range_length);
+                ret = dashenc_io_close(s, &os->out, os->temp_path);
+            }
+            av_freep(&os->temp_buffer);
 
             if (use_rename) {
                 ret = ff_rename(os->temp_path, os->full_path, os->ctx);
@@ -2010,6 +2046,9 @@ static int dash_flush(AVFormatContext *s, int final, int stream)
             c->nr_of_streams_flushed = 0;
         }
         ret = write_manifest(s, final);
+        if (ret < 0 && c->http_persistent) {
+            ret = write_manifest(s, final);
+        }
     }
     return ret;
 }
